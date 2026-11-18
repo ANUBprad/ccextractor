@@ -115,10 +115,10 @@ pub fn is_scc_file(buffer: &[u8]) -> bool {
 pub fn parse_smpte_timecode(timecode: &str, fps: SccFrameRate) -> Option<i64> {
     // Split only at the final delimiter. The clock portion must contain
     // exactly three colon-separated fields, preventing mixed delimiters.
-    let (clock, frame_part) = timecode
-        .rsplit_once(':')
-        .or_else(|| timecode.rsplit_once(';'))?;
-    let drop_frame = timecode.as_bytes().get(clock.len()) == Some(&b';');
+    let delimiter_index = timecode.rfind(|character| character == ':' || character == ';')?;
+    let drop_frame = timecode.as_bytes().get(delimiter_index) == Some(&b';');
+    let clock = &timecode[..delimiter_index];
+    let frame_part = &timecode[delimiter_index + 1..];
 
     let mut clock_parts = clock.split(':');
     let h: u64 = clock_parts.next()?.parse().ok()?;
