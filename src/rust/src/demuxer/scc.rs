@@ -142,9 +142,6 @@ pub fn parse_smpte_timecode(timecode: &str, fps: SccFrameRate) -> Option<i64> {
 
     let total_minutes = h.checked_mul(60)?.checked_add(m)?;
     let total_seconds = total_minutes.checked_mul(60)?.checked_add(s)?;
-    let mut total_frames = total_seconds
-        .checked_mul(nominal_fps)?
-        .checked_add(frame)?;
 
     if drop_frame {
         // SMPTE drop-frame skips two labels at every minute except each tenth.
@@ -153,22 +150,25 @@ pub fn parse_smpte_timecode(timecode: &str, fps: SccFrameRate) -> Option<i64> {
             return None;
         }
 
+        let total_frames = total_seconds
+            .checked_mul(30)?
+            .checked_add(frame)?;
         let dropped_frames = total_minutes
             .checked_sub(total_minutes / 10)?
             .checked_mul(2)?;
-        total_frames = total_frames.checked_sub(dropped_frames)?;
+        let elapsed_frames = total_frames.checked_sub(dropped_frames)?;
+
+        // 29.97 fps is exactly 30000/1001 frames per second.
+        let milliseconds = u128::from(elapsed_frames) * 1001 / 30;
+        return i64::try_from(milliseconds).ok();
     }
 
-    // Use integer rational arithmetic to avoid floating-point drift and
-    // preserve the 1000/24, 1000/25, 1000/30, and 1001/30 ms frame periods.
-    let (numerator, denominator) = match fps {
-        SccFrameRate::Fps29_97 => (u128::from(total_frames) * 1001, 30_u128),
-        SccFrameRate::Fps24 => (u128::from(total_frames) * 1000, 24),
-        SccFrameRate::Fps25 => (u128::from(total_frames) * 1000, 25),
-        SccFrameRate::Fps30 => (u128::from(total_frames) * 1000, 30),
-    };
-
-    i64::try_from(numerator / denominator).ok()
+    // Preserve the existing non-drop-frame convention: whole clock seconds
+    // remain wall-clock seconds, and the frame field contributes its
+    // fractional-frame duration. This also follows ms_per_frame() for 23.976.
+    let whole_seconds_ms = u128::from(total_seconds) * 1000;
+    let frame_ms = (frame as f64 * fps.ms_per_frame()) as u128;
+    i64::try_from(whole_seconds_ms + frame_ms).ok()
 }
 
 /// Parse hex pair string (e.g., "9420") to bytes
@@ -309,22 +309,22 @@ mod tests {
 
     #[test]
     fn test_parse_smpte_timecode() {
-        // 29.97fps non-drop-frame: 30 nominal frames take 1001ms.
+        // Non-drop-frame timestamps retain wall-clock seconds.
         assert_eq!(
             parse_smpte_timecode("00:00:00:00", SccFrameRate::Fps29_97),
             Some(0)
         );
         assert_eq!(
             parse_smpte_timecode("00:00:01:00", SccFrameRate::Fps29_97),
-            Some(1001)
+            Some(1000)
         );
         assert_eq!(
             parse_smpte_timecode("00:01:00:00", SccFrameRate::Fps29_97),
-            Some(60060)
+            Some(60000)
         );
         assert_eq!(
             parse_smpte_timecode("01:00:00:00", SccFrameRate::Fps29_97),
-            Some(3603600)
+            Some(3600000)
         );
 
         // Integer frame rates use the frame count, not wall-clock fields.
@@ -464,7 +464,7 @@ mod tests {
         assert_eq!(result.lines[0].time_ms, 0);
         assert_eq!(result.lines[0].pairs.len(), 2);
         assert_eq!(result.lines[0].pairs[0], [0x94, 0x20]);
-        assert_eq!(result.lines[1].time_ms, 1001);
+        assert_eq!(result.lines[1].time_ms, 1000);
         assert_eq!(result.lines[1].pairs[0], [0x94, 0x2C]);
     }
 
@@ -501,14 +501,14 @@ mod tests {
         assert_eq!(result.lines[0].pairs.len(), 11);
 
         // Second line: EDM (Erase Displayed Memory)
-        assert_eq!(result.lines[1].time_ms, 2002);
+        assert_eq!(result.lines[1].time_ms, 2000);
         assert_eq!(result.lines[1].pairs[0], [0x94, 0x2C]);
 
         // Third line: "Testing SCC input."
-        assert_eq!(result.lines[2].time_ms, 4004);
+        assert_eq!(result.lines[2].time_ms, 4000);
 
         // Fourth line: EDM
-        assert_eq!(result.lines[3].time_ms, 6006);
+        assert_eq!(result.lines[3].time_ms, 6000);
     }
 
     #[test]
@@ -534,7 +534,7 @@ mod tests {
 
         assert_eq!(caption_count, 3); // 2 from first line + 1 from second
         assert_eq!(timing_count, 2); // One per line
-        assert_eq!(last_time_ms, 1001); // 30 frames at 29.97 fps
+        assert_eq!(last_time_ms, 1000); // Whole seconds retain wall-clock timing
     }
 
     #[test]
