@@ -130,12 +130,9 @@ pub fn parse_smpte_timecode(timecode: &str, fps: SccFrameRate) -> Option<i64> {
     }
 
     let frame: u64 = frame_part.parse().ok()?;
-    let nominal_fps = match fps {
-        SccFrameRate::Fps29_97 => 30_u64,
-        SccFrameRate::Fps24 => 24,
-        SccFrameRate::Fps25 => 25,
-        SccFrameRate::Fps30 => 30,
-    };
+    // Derive the nominal frame count so additional rates such as 23.976
+    // remain supported without duplicating the enum's frame-rate mapping.
+    let nominal_fps = (1000.0 / fps.ms_per_frame()).round() as u64;
 
     if frame >= nominal_fps || (drop_frame && fps != SccFrameRate::Fps29_97) {
         return None;
