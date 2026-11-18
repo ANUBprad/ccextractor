@@ -23,7 +23,7 @@ pub const SCC_HEADER: &[u8] = b"Scenarist_SCC V1.0";
 /// Frame rate options for SMPTE timecode conversion
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SccFrameRate {
-    /// NTSC drop-frame (default) - 29.97fps
+    /// NTSC 29.97fps (default); the timecode separator selects drop-frame or non-drop-frame
     #[default]
     Fps29_97,
     /// Film - 24fps
@@ -100,32 +100,75 @@ pub fn is_scc_file(buffer: &[u8]) -> bool {
     data.len() >= SCC_HEADER.len() && &data[..SCC_HEADER.len()] == SCC_HEADER
 }
 
-/// Parse SMPTE timecode to milliseconds
+/// Parse SMPTE timecode to milliseconds.
 ///
-/// Format: HH:MM:SS:FF or HH:MM:SS;FF (drop-frame uses semicolon)
+/// A colon before the frame number denotes non-drop-frame timecode. A
+/// semicolon denotes drop-frame timecode and is valid only for 29.97 fps.
 ///
-/// # Arguments
-/// * `timecode` - The SMPTE timecode string
-/// * `fps` - The frame rate to use for conversion
+/// For 29.97 fps, each nominal frame represents 1001/30 milliseconds. Drop
+/// frame timecode omits frame labels 00 and 01 at the start of every minute,
+/// except each tenth minute; the omitted labels are subtracted before
+/// converting the frame count to elapsed time.
 ///
-/// # Returns
-/// The time in milliseconds, or None if parsing fails
+/// Returns `None` for malformed or out-of-range timecodes, invalid
+/// drop-frame labels, or timestamps that cannot fit in an `i64`.
 pub fn parse_smpte_timecode(timecode: &str, fps: SccFrameRate) -> Option<i64> {
-    let parts: Vec<&str> = timecode.split([':', ';']).collect();
-    if parts.len() != 4 {
+    // Split only at the final delimiter. The clock portion must contain
+    // exactly three colon-separated fields, preventing mixed delimiters.
+    let (clock, frame_part) = timecode
+        .rsplit_once(':')
+        .or_else(|| timecode.rsplit_once(';'))?;
+    let drop_frame = timecode.as_bytes().get(clock.len()) == Some(&b';');
+
+    let mut clock_parts = clock.split(':');
+    let h: u64 = clock_parts.next()?.parse().ok()?;
+    let m: u64 = clock_parts.next()?.parse().ok()?;
+    let s: u64 = clock_parts.next()?.parse().ok()?;
+    if clock_parts.next().is_some() || m >= 60 || s >= 60 {
         return None;
     }
 
-    let h: u32 = parts[0].parse().ok()?;
-    let m: u32 = parts[1].parse().ok()?;
-    let s: u32 = parts[2].parse().ok()?;
-    let f: u32 = parts[3].parse().ok()?;
+    let frame: u64 = frame_part.parse().ok()?;
+    let nominal_fps = match fps {
+        SccFrameRate::Fps29_97 => 30_u64,
+        SccFrameRate::Fps24 => 24,
+        SccFrameRate::Fps25 => 25,
+        SccFrameRate::Fps30 => 30,
+    };
 
-    // Convert to milliseconds based on frame rate
-    let ms_per_frame = fps.ms_per_frame();
-    let total_ms = (h * 3600000 + m * 60000 + s * 1000) as f64 + (f as f64 * ms_per_frame);
+    if frame >= nominal_fps || (drop_frame && fps != SccFrameRate::Fps29_97) {
+        return None;
+    }
 
-    Some(total_ms as i64)
+    let total_minutes = h.checked_mul(60)?.checked_add(m)?;
+    let total_seconds = total_minutes.checked_mul(60)?.checked_add(s)?;
+    let mut total_frames = total_seconds
+        .checked_mul(nominal_fps)?
+        .checked_add(frame)?;
+
+    if drop_frame {
+        // SMPTE drop-frame skips two labels at every minute except each tenth.
+        // Labels 00 and 01 at those minute boundaries are therefore invalid.
+        if m % 10 != 0 && s == 0 && frame < 2 {
+            return None;
+        }
+
+        let dropped_frames = total_minutes
+            .checked_sub(total_minutes / 10)?
+            .checked_mul(2)?;
+        total_frames = total_frames.checked_sub(dropped_frames)?;
+    }
+
+    // Use integer rational arithmetic to avoid floating-point drift and
+    // preserve the 1000/24, 1000/25, 1000/30, and 1001/30 ms frame periods.
+    let (numerator, denominator) = match fps {
+        SccFrameRate::Fps29_97 => (u128::from(total_frames) * 1001, 30_u128),
+        SccFrameRate::Fps24 => (u128::from(total_frames) * 1000, 24),
+        SccFrameRate::Fps25 => (u128::from(total_frames) * 1000, 25),
+        SccFrameRate::Fps30 => (u128::from(total_frames) * 1000, 30),
+    };
+
+    i64::try_from(numerator / denominator).ok()
 }
 
 /// Parse hex pair string (e.g., "9420") to bytes
@@ -266,45 +309,88 @@ mod tests {
 
     #[test]
     fn test_parse_smpte_timecode() {
-        // 29.97fps
+        // 29.97fps non-drop-frame: 30 nominal frames take 1001ms.
         assert_eq!(
             parse_smpte_timecode("00:00:00:00", SccFrameRate::Fps29_97),
             Some(0)
         );
         assert_eq!(
             parse_smpte_timecode("00:00:01:00", SccFrameRate::Fps29_97),
-            Some(1000)
+            Some(1001)
         );
         assert_eq!(
             parse_smpte_timecode("00:01:00:00", SccFrameRate::Fps29_97),
-            Some(60000)
+            Some(60060)
         );
         assert_eq!(
             parse_smpte_timecode("01:00:00:00", SccFrameRate::Fps29_97),
-            Some(3600000)
+            Some(3603600)
         );
 
-        // 25fps - 25 frames = 1 second
+        // Integer frame rates use the frame count, not wall-clock fields.
         assert_eq!(
-            parse_smpte_timecode("00:00:00:25", SccFrameRate::Fps25),
+            parse_smpte_timecode("00:00:01:00", SccFrameRate::Fps25),
+            Some(1000)
+        );
+        assert_eq!(
+            parse_smpte_timecode("00:00:01:00", SccFrameRate::Fps24),
+            Some(1000)
+        );
+        assert_eq!(
+            parse_smpte_timecode("00:00:01:00", SccFrameRate::Fps30),
             Some(1000)
         );
 
-        // 24fps - 24 frames = 1 second
-        let time_24 = parse_smpte_timecode("00:00:00:24", SccFrameRate::Fps24).unwrap();
-        assert!((999..=1001).contains(&time_24)); // Approximately 1 second
-
-        // 30fps - 30 frames = 1 second
-        let time_30 = parse_smpte_timecode("00:00:00:30", SccFrameRate::Fps30).unwrap();
-        assert!((999..=1001).contains(&time_30)); // Approximately 1 second
-
-        // Drop-frame separator (semicolon)
+        // Drop-frame skips two frame labels at each minute except every tenth.
         assert_eq!(
             parse_smpte_timecode("00:00:01;00", SccFrameRate::Fps29_97),
-            Some(1000)
+            Some(1001)
+        );
+        assert_eq!(
+            parse_smpte_timecode("00:10:00;00", SccFrameRate::Fps29_97),
+            Some(599999)
+        );
+        assert_eq!(
+            parse_smpte_timecode("01:00:00;00", SccFrameRate::Fps29_97),
+            Some(3599996)
         );
 
-        // Invalid timecodes
+        // Invalid dropped labels at minute boundaries.
+        assert_eq!(
+            parse_smpte_timecode("00:01:00;00", SccFrameRate::Fps29_97),
+            None
+        );
+        assert_eq!(
+            parse_smpte_timecode("00:01:00;01", SccFrameRate::Fps29_97),
+            None
+        );
+        assert_eq!(
+            parse_smpte_timecode("00:10:00;00", SccFrameRate::Fps29_97),
+            Some(599999)
+        );
+
+        // Invalid frame, minute, and second components.
+        for (timecode, rate) in [
+            ("00:00:00:30", SccFrameRate::Fps29_97),
+            ("00:00:00:24", SccFrameRate::Fps24),
+            ("00:00:00:25", SccFrameRate::Fps25),
+            ("00:00:00:30", SccFrameRate::Fps30),
+            ("00:60:00:00", SccFrameRate::Fps29_97),
+            ("00:00:60:00", SccFrameRate::Fps29_97),
+            ("00:00:00;00", SccFrameRate::Fps25),
+            ("00;00:00:00", SccFrameRate::Fps29_97),
+            ("00:00:00:00:00", SccFrameRate::Fps29_97),
+        ] {
+            assert_eq!(parse_smpte_timecode(timecode, rate), None, "{timecode}");
+        }
+
+        // Reject overflow rather than wrapping arithmetic.
+        assert_eq!(
+            parse_smpte_timecode("18446744073709551615:00:00:00", SccFrameRate::Fps29_97),
+            None
+        );
+
+        // Invalid shapes and non-numeric components.
         assert_eq!(
             parse_smpte_timecode("00:00:00", SccFrameRate::Fps29_97),
             None
@@ -378,7 +464,7 @@ mod tests {
         assert_eq!(result.lines[0].time_ms, 0);
         assert_eq!(result.lines[0].pairs.len(), 2);
         assert_eq!(result.lines[0].pairs[0], [0x94, 0x20]);
-        assert_eq!(result.lines[1].time_ms, 1000);
+        assert_eq!(result.lines[1].time_ms, 1001);
         assert_eq!(result.lines[1].pairs[0], [0x94, 0x2C]);
     }
 
@@ -415,14 +501,14 @@ mod tests {
         assert_eq!(result.lines[0].pairs.len(), 11);
 
         // Second line: EDM (Erase Displayed Memory)
-        assert_eq!(result.lines[1].time_ms, 2000);
+        assert_eq!(result.lines[1].time_ms, 2002);
         assert_eq!(result.lines[1].pairs[0], [0x94, 0x2C]);
 
         // Third line: "Testing SCC input."
-        assert_eq!(result.lines[2].time_ms, 4000);
+        assert_eq!(result.lines[2].time_ms, 4004);
 
         // Fourth line: EDM
-        assert_eq!(result.lines[3].time_ms, 6000);
+        assert_eq!(result.lines[3].time_ms, 6006);
     }
 
     #[test]
@@ -448,7 +534,7 @@ mod tests {
 
         assert_eq!(caption_count, 3); // 2 from first line + 1 from second
         assert_eq!(timing_count, 2); // One per line
-        assert_eq!(last_time_ms, 1000); // Last timing was at 1 second
+        assert_eq!(last_time_ms, 1001); // 30 frames at 29.97 fps
     }
 
     #[test]
