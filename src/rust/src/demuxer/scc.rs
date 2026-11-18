@@ -115,7 +115,8 @@ pub fn is_scc_file(buffer: &[u8]) -> bool {
 pub fn parse_smpte_timecode(timecode: &str, fps: SccFrameRate) -> Option<i64> {
     // Split only at the final delimiter. The clock portion must contain
     // exactly three colon-separated fields, preventing mixed delimiters.
-    let delimiter_index = timecode.rfind(|character| character == ':' || character == ';')?;
+    let delimiter_index = timecode
+        .rfind(|character| character == ':' || character == ';')?;
     let drop_frame = timecode.as_bytes().get(delimiter_index) == Some(&b';');
     let clock = &timecode[..delimiter_index];
     let frame_part = &timecode[delimiter_index + 1..];
@@ -160,7 +161,10 @@ pub fn parse_smpte_timecode(timecode: &str, fps: SccFrameRate) -> Option<i64> {
 
         // 29.97 fps is exactly 30000/1001 frames per second.
         let milliseconds = u128::from(elapsed_frames) * 1001 / 30;
-        return i64::try_from(milliseconds).ok();
+        if milliseconds > i64::MAX as u128 {
+            return None;
+        }
+        return Some(milliseconds as i64);
     }
 
     // Preserve the existing non-drop-frame convention: whole clock seconds
@@ -168,7 +172,11 @@ pub fn parse_smpte_timecode(timecode: &str, fps: SccFrameRate) -> Option<i64> {
     // fractional-frame duration. This also follows ms_per_frame() for 23.976.
     let whole_seconds_ms = u128::from(total_seconds) * 1000;
     let frame_ms = (frame as f64 * fps.ms_per_frame()) as u128;
-    i64::try_from(whole_seconds_ms + frame_ms).ok()
+    let milliseconds = whole_seconds_ms + frame_ms;
+    if milliseconds > i64::MAX as u128 {
+        return None;
+    }
+    Some(milliseconds as i64)
 }
 
 /// Parse hex pair string (e.g., "9420") to bytes
